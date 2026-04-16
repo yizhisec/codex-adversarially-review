@@ -126,6 +126,10 @@ scripts/
 
 `scripts/lib/` 下的运行时模块改编自 [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc)（Apache 2.0 许可）。
 
+## 社区
+
+基于 [Claude Code](https://claude.ai/code) 构建。更多 Claude Code 技能和工作流请访问 [cdcode.org](https://cdcode.org)。
+
 ## 许可证
 
 MIT

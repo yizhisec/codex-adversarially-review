@@ -126,6 +126,10 @@ scripts/
 
 Runtime modules under `scripts/lib/` are adapted from [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc) (MIT licensed).
 
+## Community
+
+Built with [Claude Code](https://claude.ai/code). More Claude Code skills and workflows at [cdcode.org](https://cdcode.org).
+
 ## License
 
 MIT
