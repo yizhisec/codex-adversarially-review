@@ -1,0 +1,22 @@
+This project includes code adapted from:
+
+  openai/codex-plugin-cc
+  https://github.com/openai/codex-plugin-cc
+  Copyright (c) OpenAI
+  Licensed under the Apache License 2.0
+
+The following files under scripts/lib/ are derived from codex-plugin-cc:
+  - app-server.mjs
+  - args.mjs
+  - broker-endpoint.mjs
+  - broker-lifecycle.mjs
+  - codex.mjs
+  - fs.mjs
+  - git.mjs
+  - process.mjs
+  - prompts.mjs
+  - workspace.mjs
+
+The prompt template scripts/prompts/adversarial-review.md and
+the schema scripts/schemas/review-output.schema.json are also
+derived from codex-plugin-cc.
