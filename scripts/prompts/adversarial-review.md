@@ -9,6 +9,10 @@ Target: {{TARGET_LABEL}}
 User focus: {{USER_FOCUS}}
 </task>
 
+<prior_findings>
+{{PRIOR_FINDINGS}}
+</prior_findings>
+
 <operating_stance>
 Default to skepticism.
 Assume the change can fail in subtle, high-cost, or user-visible ways until the evidence says otherwise.
@@ -69,6 +73,7 @@ If a conclusion depends on an inference, state that explicitly in the finding bo
 Prefer one strong finding over several weak ones.
 Do not dilute serious issues with filler.
 If the change looks safe, say so directly and return no findings.
+Do not re-report issues already listed in prior_findings above.
 </calibration_rules>
 
 <final_check>

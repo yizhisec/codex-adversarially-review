@@ -1,35 +1,21 @@
 /**
  * @typedef {Error & { data?: unknown, rpcCode?: number }} ProtocolError
- * @typedef {import("./app-server-protocol").AppServerMethod} AppServerMethod
- * @typedef {import("./app-server-protocol").AppServerNotification} AppServerNotification
- * @typedef {import("./app-server-protocol").AppServerNotificationHandler} AppServerNotificationHandler
- * @typedef {import("./app-server-protocol").ClientInfo} ClientInfo
- * @typedef {import("./app-server-protocol").CodexAppServerClientOptions} CodexAppServerClientOptions
- * @typedef {import("./app-server-protocol").InitializeCapabilities} InitializeCapabilities
  */
 import fs from "node:fs";
-import net from "node:net";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
-import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
-import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
 
-export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
-export const BROKER_BUSY_RPC_CODE = -32001;
-
-/** @type {ClientInfo} */
+/** @type {{ title: string, name: string, version: string }} */
 const DEFAULT_CLIENT_INFO = {
-  title: "Codex Plugin",
+  title: "Codex Adversarial Review",
   name: "Claude Code",
   version: PLUGIN_MANIFEST.version ?? "0.0.0"
 };
 
-/** @type {InitializeCapabilities} */
 const DEFAULT_CAPABILITIES = {
   experimentalApi: false,
   optOutNotificationMethods: [
@@ -62,9 +48,7 @@ class AppServerClientBase {
     this.stderr = "";
     this.closed = false;
     this.exitError = null;
-    /** @type {AppServerNotificationHandler | null} */
     this.notificationHandler = null;
-    this.lineBuffer = "";
     this.transport = "unknown";
 
     this.exitPromise = new Promise((resolve) => {
@@ -76,12 +60,6 @@ class AppServerClientBase {
     this.notificationHandler = handler;
   }
 
-  /**
-   * @template {AppServerMethod} M
-   * @param {M} method
-   * @param {import("./app-server-protocol").AppServerRequestParams<M>} params
-   * @returns {Promise<import("./app-server-protocol").AppServerResponse<M>>}
-   */
   request(method, params) {
     if (this.closed) {
       throw new Error("codex app-server client is closed.");
@@ -103,17 +81,6 @@ class AppServerClientBase {
     this.sendMessage({ method, params });
   }
 
-  handleChunk(chunk) {
-    this.lineBuffer += chunk;
-    let newlineIndex = this.lineBuffer.indexOf("\n");
-    while (newlineIndex !== -1) {
-      const line = this.lineBuffer.slice(0, newlineIndex);
-      this.lineBuffer = this.lineBuffer.slice(newlineIndex + 1);
-      this.handleLine(line);
-      newlineIndex = this.lineBuffer.indexOf("\n");
-    }
-  }
-
   handleLine(line) {
     if (!line.trim()) {
       return;
@@ -128,7 +95,10 @@ class AppServerClientBase {
     }
 
     if (message.id !== undefined && message.method) {
-      this.handleServerRequest(message);
+      this.sendMessage({
+        id: message.id,
+        error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
+      });
       return;
     }
 
@@ -148,15 +118,8 @@ class AppServerClientBase {
     }
 
     if (message.method && this.notificationHandler) {
-      this.notificationHandler(/** @type {AppServerNotification} */ (message));
+      this.notificationHandler(message);
     }
-  }
-
-  handleServerRequest(message) {
-    this.sendMessage({
-      id: message.id,
-      error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
-    });
   }
 
   handleExit(error) {
@@ -179,10 +142,16 @@ class AppServerClientBase {
   }
 }
 
-class SpawnedCodexAppServerClient extends AppServerClientBase {
+export class CodexAppServerClient extends AppServerClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
     this.transport = "direct";
+  }
+
+  static async connect(cwd, options = {}) {
+    const client = new CodexAppServerClient(cwd, options);
+    await client.initialize();
+    return client;
   }
 
   async initialize() {
@@ -241,19 +210,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.proc.stdin.end();
       setTimeout(() => {
         if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
-          // On Windows with shell: true, the direct child is cmd.exe.
-          // Use terminateProcessTree to kill the entire tree including
-          // the grandchild node process.
-          if (process.platform === "win32") {
-            try {
-              terminateProcessTree(this.proc.pid);
-            } catch {
-              // Best-effort cleanup inside an unref'd timer — swallow errors
-              // to avoid crashing the host process during shutdown.
-            }
-          } else {
-            this.proc.kill("SIGTERM");
-          }
+          this.proc.kill("SIGTERM");
         }
       }, 50).unref?.();
     }
@@ -268,83 +225,5 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       throw new Error("codex app-server stdin is not available.");
     }
     stdin.write(line);
-  }
-}
-
-class BrokerCodexAppServerClient extends AppServerClientBase {
-  constructor(cwd, options = {}) {
-    super(cwd, options);
-    this.transport = "broker";
-    this.endpoint = options.brokerEndpoint;
-  }
-
-  async initialize() {
-    await new Promise((resolve, reject) => {
-      const target = parseBrokerEndpoint(this.endpoint);
-      this.socket = net.createConnection({ path: target.path });
-      this.socket.setEncoding("utf8");
-      this.socket.on("connect", resolve);
-      this.socket.on("data", (chunk) => {
-        this.handleChunk(chunk);
-      });
-      this.socket.on("error", (error) => {
-        if (!this.exitResolved) {
-          reject(error);
-        }
-        this.handleExit(error);
-      });
-      this.socket.on("close", () => {
-        this.handleExit(this.exitError);
-      });
-    });
-
-    await this.request("initialize", {
-      clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
-      capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
-    });
-    this.notify("initialized", {});
-  }
-
-  async close() {
-    if (this.closed) {
-      await this.exitPromise;
-      return;
-    }
-
-    this.closed = true;
-    if (this.socket) {
-      this.socket.end();
-    }
-    await this.exitPromise;
-  }
-
-  sendMessage(message) {
-    const line = `${JSON.stringify(message)}\n`;
-    const socket = this.socket;
-    if (!socket) {
-      throw new Error("codex app-server broker connection is not connected.");
-    }
-    socket.write(line);
-  }
-}
-
-export class CodexAppServerClient {
-  static async connect(cwd, options = {}) {
-    let brokerEndpoint = null;
-    if (!options.disableBroker) {
-      brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
-      if (!brokerEndpoint && options.reuseExistingBroker) {
-        brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
-      }
-      if (!brokerEndpoint && !options.reuseExistingBroker) {
-        const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
-        brokerEndpoint = brokerSession?.endpoint ?? null;
-      }
-    }
-    const client = brokerEndpoint
-      ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
-      : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
-    return client;
   }
 }

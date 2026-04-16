@@ -87,32 +87,45 @@ function normalizeArgv(argv) {
   return argv;
 }
 
-function buildRoundPrompt(context, roundDef, userFocus) {
+function buildRoundPrompt(context, roundDef, userFocus, priorFindings) {
   const template = loadPromptTemplate(ROOT_DIR, "adversarial-review");
   const combinedFocus = userFocus
     ? `${roundDef.focus}\n\nAdditional user focus: ${userFocus}`
     : roundDef.focus;
+  const priorText = priorFindings.length === 0
+    ? "No prior findings yet. This is the first round."
+    : priorFindings.map((f, i) =>
+        `${i + 1}. [${f.severity}] ${f.title} (${f.file}:${f.line_start}-${f.line_end})`
+      ).join("\n");
   return interpolateTemplate(template, {
     REVIEW_KIND: `Adversarial Review — Round ${roundDef.round}: ${roundDef.lens}`,
     TARGET_LABEL: context.target.label,
     USER_FOCUS: combinedFocus,
+    PRIOR_FINDINGS: priorText,
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
     REVIEW_INPUT: context.content
   });
 }
 
+function severityRank(severity) {
+  switch (severity) {
+    case "critical": return 0;
+    case "high": return 1;
+    case "medium": return 2;
+    default: return 3;
+  }
+}
+
 function deduplicateFindings(allFindings) {
-  const seen = new Set();
-  const unique = [];
+  const byKey = new Map();
   for (const f of allFindings) {
-    // 按 file + line_start + title 前 40 字符去重
     const key = `${f.file}:${f.line_start}:${(f.title || "").slice(0, 40)}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      unique.push(f);
+    const existing = byKey.get(key);
+    if (!existing || severityRank(f.severity) < severityRank(existing.severity)) {
+      byKey.set(key, f);
     }
   }
-  return unique;
+  return [...byKey.values()];
 }
 
 async function main() {
@@ -157,21 +170,44 @@ async function main() {
 
   // 逐轮执行 Codex 审查——先跑 5 轮强制，再根据结果决定是否继续 6-10 轮
   const roundResults = [];
+  const accumulatedFindings = [];
 
   async function runRound(roundDef) {
     process.stderr.write(`\n=== Round ${roundDef.round}: ${roundDef.lens} ===\n`);
-    const prompt = buildRoundPrompt(context, roundDef, userFocus);
-    const result = await runAppServerTurn(context.repoRoot, {
-      prompt,
-      model: options.model ?? null,
-      sandbox: "read-only",
-      outputSchema,
-      onProgress: progressHandler
-    });
+    const prompt = buildRoundPrompt(context, roundDef, userFocus, accumulatedFindings);
+    let result;
+    try {
+      result = await runAppServerTurn(context.repoRoot, {
+        prompt,
+        model: options.model ?? null,
+        sandbox: "read-only",
+        outputSchema,
+        onProgress: progressHandler
+      });
+    } catch (err) {
+      process.stderr.write(`[codex] Round ${roundDef.round} failed: ${err.message}\n`);
+      roundResults.push({
+        round: roundDef.round,
+        lens: roundDef.lens,
+        threadId: null,
+        status: 1,
+        parsed: { parsed: null, parseError: err.message, rawOutput: "" },
+        reasoningSummary: [],
+        stderr: "",
+        error: err
+      });
+      return;
+    }
     const parsed = parseStructuredOutput(result.finalMessage, {
       status: result.status,
       failureMessage: result.error?.message ?? result.stderr
     });
+    // Accumulate findings for PRIOR_FINDINGS in subsequent rounds
+    if (parsed.parsed?.findings) {
+      for (const f of parsed.parsed.findings) {
+        accumulatedFindings.push({ ...f, _round: roundDef.round, _lens: roundDef.lens });
+      }
+    }
     roundResults.push({
       round: roundDef.round,
       lens: roundDef.lens,
@@ -209,7 +245,6 @@ async function main() {
   const totalRounds = roundResults.length;
 
   // 汇总所有 findings 并去重
-  const allFindings = [];
   const allNextSteps = [];
   const allReasoningSummary = [];
   let worstVerdict = "approve";
@@ -218,9 +253,6 @@ async function main() {
     if (rr.parsed.parsed) {
       if (rr.parsed.parsed.verdict === "needs-attention") {
         worstVerdict = "needs-attention";
-      }
-      for (const f of rr.parsed.parsed.findings || []) {
-        allFindings.push({ ...f, _round: rr.round, _lens: rr.lens });
       }
       for (const step of rr.parsed.parsed.next_steps || []) {
         allNextSteps.push(step);
@@ -231,7 +263,7 @@ async function main() {
     }
   }
 
-  const uniqueFindings = deduplicateFindings(allFindings);
+  const uniqueFindings = deduplicateFindings(accumulatedFindings);
   const uniqueNextSteps = [...new Set(allNextSteps)];
   const roundsWithFindings = roundResults.filter(r => r.parsed.parsed?.findings?.length > 0).length;
 
